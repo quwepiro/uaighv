@@ -1,0 +1,415 @@
+name: Build Infinity For Reddit
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # Check every day at 6am
+  workflow_dispatch: # Allow manual triggering
+
+# Define permissions for the GITHUB_TOKEN
+permissions:
+  contents: write # Required for creating releases and uploading assets
+  actions: read # Required for checking workflow status
+
+env:
+  INFINITY_REPO: Docile-Alligator/Infinity-For-Reddit
+  TARGET_ARCH: arm64-v8a
+  # Commented out architectures for future use
+  # ARCHITECTURES: arm64-v8a,armeabi-v7a,x86,x86_64
+  # TARGET_ARCH: ${{ matrix.arch }}
+
+  STOREPASS_DEFAULT: "Infinity"
+  KEYPASS_DEFAULT: "Infinity"
+  KEYALIAS_DEFAULT: "Infinity"
+  REDIRECT_URI_DEFAULT: "http://127.0.0.1"
+
+jobs:
+  # Add a job to check if this is a private repository
+  check-repository:
+    runs-on: ubuntu-latest
+    outputs:
+      is_private: ${{ steps.check_repo.outputs.is_private }}
+    steps:
+      - name: Check if repository is private
+        id: check_repo
+        run: |
+          # Get repository visibility
+          REPO_VISIBILITY=$(gh api repos/${{ github.repository }} --jq .private)
+
+          if [ "$REPO_VISIBILITY" != "true" ]; then
+            echo "Error: This repository must be private to protect your API credentials and releases"
+            echo "Please make your repository private in Settings > General > Danger Zone > Change repository visibility"
+            exit 1
+          fi
+
+          echo "Repository is private, proceeding with workflow"
+          echo "is_private=true" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  check-releases:
+    needs: check-repository
+    if: needs.check-repository.outputs.is_private == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      latest_release: ${{ steps.get_latest_release.outputs.tag_name }}
+      should_build: ${{ steps.check_release.outputs.should_build }}
+
+    steps:
+      - name: Get latest Infinity release
+        id: get_latest_release
+        run: |
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/${{ env.INFINITY_REPO }}/releases/latest | jq -r .tag_name)
+          echo "tag_name=$LATEST_RELEASE" >> $GITHUB_OUTPUT
+
+      - name: Validate latest release output
+        if: steps.get_latest_release.outputs.tag_name == '' || steps.get_latest_release.outputs.tag_name == 'null'
+        run: |
+          echo "Error: Unable to determine latest release tag from Infinity repo."
+          exit 1
+
+      - name: Get latest local release
+        id: get_local_release
+        run: |
+          # Check if there are any releases
+          RELEASE_COUNT=$(gh api repos/${{ github.repository }}/releases --jq 'length')
+
+          if [ "$RELEASE_COUNT" -eq 0 ]; then
+            echo "No releases found, will build the latest version"
+            echo "local_release=none" >> $GITHUB_OUTPUT
+          else
+            LOCAL_RELEASE=$(gh api repos/${{ github.repository }}/releases/latest --jq .tag_name)
+            echo "local_release=$LOCAL_RELEASE" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if build needed
+        id: check_release
+        run: |
+          echo "Infinity latest: ${{ steps.get_latest_release.outputs.tag_name }}"
+          echo "Local latest: ${{ steps.get_local_release.outputs.local_release }}"
+
+          if [ "${{ steps.get_local_release.outputs.local_release }}" = "none" ]; then
+            echo "No releases exist, building needed"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.get_local_release.outputs.local_release }}" != "${{ steps.get_latest_release.outputs.tag_name }}" ]; then
+            echo "Versions differ, building needed"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "Versions match, no build needed"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+  validate-secrets:
+    needs: check-repository
+    if: needs.check-repository.outputs.is_private == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      keystore_path: ${{ steps.validate_keystore.outputs.keystore_path }}
+
+    steps:
+      - name: Check required secrets
+        id: check_secrets
+        run: |
+          if [ -z "${{ secrets.REDDIT_API_CLIENT_ID }}" ]; then
+            echo "Error: REDDIT_API_CLIENT_ID is not set"
+            exit 1
+          fi
+          if [ -z "${{ secrets.REDDIT_USERNAME }}" ]; then
+            echo "Error: REDDIT_USERNAME is not set"
+            exit 1
+          fi
+          # Check for keystore secrets
+          if [ -z "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "Error: KEYSTORE_BASE64 is not set"
+            exit 1
+          fi
+      
+      - name: Check optional secrets
+        id: check_optional_secrets
+        run: |
+          if [ -z "${{ secrets.KEYSTORE_PASSWORD }}" ]; then
+            echo "KEYSTORE_PASSWORD is not set, using default value '${{ env.STOREPASS_DEFAULT }}'"
+          fi
+          if [ -z "${{ secrets.KEY_ALIAS }}" ]; then
+            echo "KEY_ALIAS is not set, using default value '${{ env.KEYALIAS_DEFAULT }}'"
+          fi
+          if [ -z "${{ secrets.KEY_PASSWORD }}" ]; then
+            echo "KEY_PASSWORD is not set, using default value '${{ env.KEYPASS_DEFAULT }}'"
+          fi
+          if [ -z "${{ secrets.REDDIT_API_REDIRECT_URI }}" ]; then
+            echo "REDDIT_API_REDIRECT_URI is not set, using default value '${{ env.REDIRECT_URI_DEFAULT }}'"
+          fi
+          if [ -z "${{ secrets.GIPHY_API_KEY }}" ]; then
+            echo "GIPHY_API_KEY is not set, no giphy api key will be used"
+          fi
+
+      - name: Validate API credentials
+        run: |
+          # Validate API client ID format
+          if [[ ! "${{ secrets.REDDIT_API_CLIENT_ID }}" =~ ^[a-zA-Z0-9_-]{20,30}$ ]]; then
+            echo "Error: Invalid REDDIT_API_CLIENT_ID format"
+            echo "Client ID should be 20-30 characters long and contain only letters, numbers, hyphens, and underscores"
+            exit 1
+          fi
+
+          # Validate username format
+          if [[ ! "${{ secrets.REDDIT_USERNAME }}" =~ ^[a-zA-Z0-9_-]{3,20}$ ]]; then
+            echo "Error: Invalid REDDIT_USERNAME format"
+            echo "Username should be 3-20 characters long and contain only letters, numbers, underscores, and hyphens"
+            exit 1
+          fi
+
+      - name: Validate Keystore
+        id: validate_keystore
+        run: |
+          # Decode the keystore
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > keystore.jks
+
+          # Try to list the keystore contents to validate the passwords
+          if ! keytool -list -v \
+            -keystore keystore.jks \
+            -storepass "${{ secrets.KEYSTORE_PASSWORD || env.STOREPASS_DEFAULT }}" \
+            -keypass "${{ secrets.KEY_PASSWORD || env.KEYPASS_DEFAULT }}" \
+            -alias "${{ secrets.KEY_ALIAS || env.KEYALIAS_DEFAULT }}" > /dev/null 2>&1; then
+            echo "Error: Invalid keystore password, key password, or alias"
+            echo "Please check your keystore credentials and try again"
+            exit 1
+          fi
+
+          echo "Keystore validation successful"
+          echo "keystore_path=keystore.jks" >> $GITHUB_OUTPUT
+
+  build:
+    needs: [validate-secrets, check-releases]
+    if: needs.check-releases.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.INFINITY_REPO }}
+          ref: ${{ needs.check-releases.outputs.latest_release }}
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Copy keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > app/keystore.jks
+
+      - name: Modify build.gradle
+        run: |
+          # Backup the original build.gradle
+          cp app/build.gradle app/build.gradle.bak
+
+          # Add signing configs block first
+          if ! sed -i '/android {/a\    signingConfigs {\n        release {\n            storeFile file("keystore.jks")\n            storePassword "'"${{ secrets.KEYSTORE_PASSWORD || env.STOREPASS_DEFAULT }}"'"\n            keyAlias "'"${{ secrets.KEY_ALIAS || env.KEYALIAS_DEFAULT }}"'"\n            keyPassword "'"${{ secrets.KEY_PASSWORD || env.KEYPASS_DEFAULT }}"'"\n        }\n    }' app/build.gradle; then
+            echo "Error: Failed to add signing configs"
+            cp app/build.gradle.bak app/build.gradle
+            exit 1
+          fi
+
+          # Add signing config to release buildType and disable lint
+          if ! sed -i '/buildTypes {/,/}/s/release {/release {\n            signingConfig signingConfigs.release\n            lint {\n                checkReleaseBuilds false\n                abortOnError false\n            }/' app/build.gradle; then
+            echo "Error: Failed to add signing config and disable lint"
+            cp app/build.gradle.bak app/build.gradle
+            exit 1
+          fi
+
+          # Verify the modifications
+          if ! grep -q "signingConfig signingConfigs.release" app/build.gradle; then
+            echo "Error: Failed to verify signing config in buildTypes"
+            cp app/build.gradle.bak app/build.gradle
+            exit 1
+          fi
+
+          if ! grep -q "checkReleaseBuilds false" app/build.gradle; then
+            echo "Error: Failed to verify lint configuration"
+            cp app/build.gradle.bak app/build.gradle
+            exit 1
+          fi
+
+          if ! grep -q "signingConfigs" app/build.gradle; then
+            echo "Error: Failed to verify signing configs"
+            cp app/build.gradle.bak app/build.gradle
+            exit 1
+          fi
+
+      - name: Set custom application ID
+        if: vars.APPLICATION_ID != ''
+        env:
+          APPLICATION_ID: ${{ vars.APPLICATION_ID }}
+        run: |
+          # Validate reverse domain name notation (e.g. com.example.infinity)
+          if [[ ! "$APPLICATION_ID" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
+            echo "Error: Invalid APPLICATION_ID '$APPLICATION_ID'"
+            echo "Application ID must be in reverse domain name notation, e.g. com.example.infinity"
+            exit 1
+          fi
+
+          if ! sed -i "s/applicationId \"ml\.docilealligator\.infinityforreddit\"/applicationId \"$APPLICATION_ID\"/" app/build.gradle \
+            || ! grep -q "applicationId \"$APPLICATION_ID\"" app/build.gradle; then
+            echo "Error: Failed to set application ID"
+            exit 1
+          fi
+
+          echo "Application ID set to $APPLICATION_ID"
+
+      - name: Replace API credentials and user agent
+        run: |
+          # Define the target file
+          TARGET_FILE="app/src/main/java/ml/docilealligator/infinityforreddit/utils/APIUtils.java"
+
+          # Backup the original file
+          cp "$TARGET_FILE" "${TARGET_FILE}.bak"
+
+          # Escape special characters in the replacement strings
+          CLIENT_ID_ESC=$(echo "${{ secrets.REDDIT_API_CLIENT_ID }}" | sed 's/[\/&]/\\&/g')
+          REDIRECT_URI_ESC=$(echo "${{ secrets.REDDIT_API_REDIRECT_URI || env.REDIRECT_URI_DEFAULT }}" | sed 's/[\/&]/\\&/g')
+          USERNAME_ESC=$(echo "${{ secrets.REDDIT_USERNAME }}" | sed 's/[\/&]/\\&/g')
+          USER_AGENT="android:personal-app:0.0.1 (by /u/$USERNAME_ESC)"
+          USER_AGENT_ESC=$(echo "$USER_AGENT" | sed 's/[\/&]/\\&/g')
+
+          # Replace Reddit API client ID
+          if ! sed -i "s/public static final String CLIENT_ID = \"[^\"]*\"/public static final String CLIENT_ID = \"$CLIENT_ID_ESC\"/" "$TARGET_FILE"; then
+            echo "Error: Failed to replace API client ID"
+            cp "${TARGET_FILE}.bak" "$TARGET_FILE"
+            exit 1
+          fi
+
+          # Replace redirect URI
+          if ! sed -i "s/public static final String REDIRECT_URI = \"[^\"]*\"/public static final String REDIRECT_URI = \"$REDIRECT_URI_ESC\"/" "$TARGET_FILE"; then
+            echo "Error: Failed to replace redirect URI"
+            cp "${TARGET_FILE}.bak" "$TARGET_FILE"
+            exit 1
+          fi
+
+          # Replace user agent
+          if ! sed -i "s/public static final String USER_AGENT = \"[^\"]*\"/public static final String USER_AGENT = \"$USER_AGENT_ESC\"/" "$TARGET_FILE"; then
+            echo "Error: Failed to replace user agent"
+            cp "${TARGET_FILE}.bak" "$TARGET_FILE"
+            exit 1
+          fi
+
+          # Replace anonymous user agent (only present in newer Infinity versions)
+          if grep -q "public static final String ANONYMOUS_USER_AGENT = " "$TARGET_FILE"; then
+            if ! sed -i "s/public static final String ANONYMOUS_USER_AGENT = \"[^\"]*\"/public static final String ANONYMOUS_USER_AGENT = \"$USER_AGENT_ESC\"/" "$TARGET_FILE"; then
+              echo "Error: Failed to replace anonymous user agent"
+              cp "${TARGET_FILE}.bak" "$TARGET_FILE"
+              exit 1
+            fi
+          fi
+
+          # Replace Giphy API key if provided
+          if [ -n "${{ secrets.GIPHY_API_KEY }}" ]; then
+            GIPHY_API_KEY_ESC=$(echo "${{ secrets.GIPHY_API_KEY }}" | sed 's/[\/&]/\\&/g')
+            if ! sed -i "s/public static final String GIPHY_GIF_API_KEY = \"[^\"]*\"/public static final String GIPHY_GIF_API_KEY = \"$GIPHY_API_KEY_ESC\"/" "$TARGET_FILE"; then
+              echo "Error: Failed to replace Giphy API key"
+              cp "${TARGET_FILE}.bak" "$TARGET_FILE"
+              exit 1
+            fi
+          fi
+
+          # Verify the replacements
+          if ! grep -q "CLIENT_ID = \"$CLIENT_ID_ESC\"" "$TARGET_FILE"; then
+            echo "Error: Failed to verify API client ID replacement"
+            cp "${TARGET_FILE}.bak" "$TARGET_FILE"
+            exit 1
+          fi
+
+          if ! grep -q "REDIRECT_URI = \"$REDIRECT_URI_ESC\"" "$TARGET_FILE"; then
+            echo "Error: Failed to verify redirect URI replacement"
+            cp "${TARGET_FILE}.bak" "$TARGET_FILE"
+            exit 1
+          fi
+
+          if ! grep -q "USER_AGENT = \"$USER_AGENT_ESC\"" "$TARGET_FILE"; then
+            echo "Error: Failed to verify user agent replacement"
+            cp "${TARGET_FILE}.bak" "$TARGET_FILE"
+            exit 1
+          fi
+
+          if [ -n "${{ secrets.GIPHY_API_KEY }}" ]; then
+            if ! grep -q "GIPHY_GIF_API_KEY = \"$GIPHY_API_KEY_ESC\"" "$TARGET_FILE"; then
+              echo "Error: Failed to verify Giphy API key replacement"
+              cp "${TARGET_FILE}.bak" "$TARGET_FILE"
+              exit 1
+            fi
+          fi
+
+      - name: Build APK
+        run: |
+          ./gradlew --parallel --daemon assembleRelease
+
+      - name: Verify APK
+        run: |
+          APK_PATH="./app/build/outputs/apk/release/app-release.apk"
+
+          # Check if APK exists
+          if [ ! -f "$APK_PATH" ]; then
+            echo "Error: APK file not found at expected location"
+            echo "Build directory contents:"
+            find ./app/build -type f -name "*.apk" -o -type d | sort
+            exit 1
+          fi
+
+          # Check APK size
+          APK_SIZE=$(stat -c%s "$APK_PATH")
+          if [ "$APK_SIZE" -lt 10000000 ]; then  # Less than 10MB
+            echo "Error: APK size is suspiciously small ($APK_SIZE bytes)"
+            exit 1
+          fi
+
+          echo "APK verification successful"
+          echo "Size: $APK_SIZE bytes"
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.check-releases.outputs.latest_release }}
+          name: Build of ${{ needs.check-releases.outputs.latest_release }}
+          draft: false
+          prerelease: false
+          files: |
+            app/build/outputs/apk/release/app-release.apk
+
+      - name: Save last built release
+        run: echo "${{ needs.check-releases.outputs.latest_release }}" > last_built_release.txt
+
+      - name: Cleanup old releases
+        run: |
+          if [[ ! "$KEEP_RELEASES" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Error: KEEP_RELEASES must be a positive integer, got '$KEEP_RELEASES'"
+            exit 1
+          fi
+
+          # Keep only the last $KEEP_RELEASES releases (newest first)
+          for tag in $(gh release list -R ${{ github.repository }} --limit 1000 --json tagName --jq ".[$KEEP_RELEASES:][].tagName"); do
+            gh release delete "$tag" -R ${{ github.repository }} --cleanup-tag --yes
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_RELEASES: ${{ vars.KEEP_RELEASES || '3' }}
+
+  # Example matrix job for building multiple architectures (commented out)
+  # build-matrix:
+  #   needs: check-releases
+  #   if: needs.check-releases.outputs.should_build == 'true'
+  #   runs-on: ubuntu-latest
+  #   strategy:
+  #     matrix:
+  #       arch: [arm64-v8a, armeabi-v7a, x86, x86_64]
+  #   steps:
+  #     # ... similar steps as above but using matrix.arch ...
