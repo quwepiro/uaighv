@@ -35,7 +35,7 @@ jobs:
           # Get repository visibility
           REPO_VISIBILITY=$(gh api repos/${{ github.repository }} --jq .private)
 
-          if [ "$REPO_VISIBILITY" != "true" ]; then
+          if [ "$REPO_VISIBILITY" == "true" ]; then
             echo "Error: This repository must be private to protect your API credentials and releases"
             echo "Please make your repository private in Settings > General > Danger Zone > Change repository visibility"
             exit 1
